@@ -153,6 +153,20 @@ const DROP_DOWNLOAD_ENV: &[&str] = &[
     "preferLocalBuild",
 ];
 
+/// Probe all candidates concurrently, then return the first reachable URL in
+/// the caller's stable preference order. Choosing whichever probe finishes
+/// first would make network timing part of every downstream derivation hash.
+fn first_reachable<F>(candidates: &[String], probe: F) -> Option<&String>
+where
+    F: Fn(&str) -> bool + Sync,
+{
+    let reachable: Vec<bool> = candidates.par_iter().map(|url| probe(url)).collect();
+    candidates
+        .iter()
+        .zip(reachable)
+        .find_map(|(url, ok)| ok.then_some(url))
+}
+
 pub struct Splicer {
     /// Any Guix store path (drv, output, or source) → its Nix counterpart.
     pub map: DashMap<String, String>,
@@ -626,15 +640,18 @@ impl Splicer {
         if candidates.is_empty() {
             return Err(format!("no usable URL in download env {raw_url:?}"));
         }
-        if !self.probe {
+        // Default translation must not make network reachability part of the
+        // derivation hash. Only explicit --upstream mode probes fallbacks;
+        // otherwise use the deterministic CA mirror or top-ranked source.
+        if !self.upstream || !self.probe {
             return Ok(candidates[0].clone());
         }
-        if let Some(found) = candidates.par_iter().find_any(|url| {
-            if let Some(ok) = self.url_cache.get(*url) {
+        if let Some(found) = first_reachable(&candidates, |url| {
+            if let Some(ok) = self.url_cache.get(url) {
                 return *ok.value();
             }
             let ok = net::url_ok(url);
-            self.url_cache.insert((*url).clone(), ok);
+            self.url_cache.insert(url.to_string(), ok);
             ok
         }) {
             return Ok(found.clone());
@@ -866,6 +883,26 @@ mod tests {
     }
 
     #[test]
+    fn reachable_mirror_selection_preserves_preference_order() {
+        let candidates = vec!["preferred".to_string(), "faster-fallback".to_string()];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+
+        let found = pool.install(|| {
+            first_reachable(&candidates, |url| {
+                if url == "preferred" {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                true
+            })
+        });
+
+        assert_eq!(found.map(String::as_str), Some("preferred"));
+    }
+
+    #[test]
     fn disable_builder_tests_flips_tests_flag() {
         assert_eq!(
             disable_builder_tests("(gnu-build #:source \"x\" #:tests? #t #:test-target \"check\")"),
@@ -913,6 +950,19 @@ mod tests {
         let mut d = dl("\"https://real/bash\"", true);
         s.to_fetchurl(&mut d, "https://real/bash".to_string());
         assert_eq!(d.env_get("executable"), Some("1"));
+    }
+
+    #[test]
+    fn default_mode_does_not_probe_executable_fallbacks() {
+        let s = Splicer::new();
+        let d = dl(
+            "\"https://git.savannah.gnu.org/cgit/guix.git/plain/gnu/packages/bootstrap/i686-linux/mkdir?id=44f07d1dc6806e97c4e9ee3e6be883cc59dc666e\"",
+            true,
+        );
+        assert_eq!(
+            s.choose_download_url(&d).unwrap(),
+            "https://codeberg.org/guix/guix/raw/commit/44f07d1dc6806e97c4e9ee3e6be883cc59dc666e/gnu/packages/bootstrap/i686-linux/mkdir"
+        );
     }
 
     #[test]
