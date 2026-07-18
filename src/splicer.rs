@@ -45,6 +45,34 @@ fn disable_builder_tests(builder: &str) -> String {
     builder.replace("#:tests? #t", "#:tests? #f")
 }
 
+/// Prevent install hooks from setting setuid or setgid bits in a Nix output.
+/// Nix store objects cannot retain those semantics; the operating system must
+/// install privileged programs explicitly. Guix builders already disable
+/// install-time ownership changes in either a configure flag (util-linux) or a
+/// Makefile substitution (sudo), giving us narrow insertion points for the
+/// matching mode normalization.
+fn disable_builder_setuid_install(builder: &str) -> String {
+    const CHOWN_FLAG: &str = "\"--disable-makeinstall-chown\"";
+    const SETUID_FLAG: &str = "\"--disable-makeinstall-setuid\"";
+    const REMOVE_OWNERSHIP_RULE: &str = r#"(("-o [[:graph:]]+ -g [[:graph:]]+") "")"#;
+    const REMOVE_PRIVILEGED_MODE_RULE: &str =
+        r#"(("-m[[:space:]]+0?[2-7]([0-7][0-7][0-7])" _ mode) (string-append "-m 0" mode))"#;
+
+    let mut rewritten = builder.to_string();
+    if rewritten.contains(CHOWN_FLAG) && !rewritten.contains(SETUID_FLAG) {
+        rewritten = rewritten.replacen(CHOWN_FLAG, &format!("{CHOWN_FLAG} {SETUID_FLAG}"), 1);
+    }
+    if rewritten.contains(REMOVE_OWNERSHIP_RULE) && !rewritten.contains(REMOVE_PRIVILEGED_MODE_RULE)
+    {
+        rewritten = rewritten.replacen(
+            REMOVE_OWNERSHIP_RULE,
+            &format!("{REMOVE_OWNERSHIP_RULE} {REMOVE_PRIVILEGED_MODE_RULE}"),
+            1,
+        );
+    }
+    rewritten
+}
+
 /// Keep only reference specifiers that survive translation. A specifier still
 /// pointing at `/gnu/store` had no Nix mapping and is not a valid Nix reference
 /// (Nix wants a /nix/store path or an output name), so it is dropped.
@@ -780,8 +808,11 @@ impl Splicer {
         if is_text(src)? {
             let content = fs::read_to_string(src).map_err(|e| format!("read {src}: {e}"))?;
             let mut rewritten = self.rewrite_str(&content);
-            if self.disable_tests && name.ends_with("-builder") {
-                rewritten = disable_builder_tests(&rewritten);
+            if name.ends_with("-builder") {
+                rewritten = disable_builder_setuid_install(&rewritten);
+                if self.disable_tests {
+                    rewritten = disable_builder_tests(&rewritten);
+                }
             }
             fs::write(&staged, rewritten).map_err(|e| e.to_string())?;
         } else {
@@ -911,6 +942,40 @@ mod tests {
         // Idempotent / no-op when already disabled or absent.
         assert_eq!(disable_builder_tests("#:tests? #f"), "#:tests? #f");
         assert_eq!(disable_builder_tests("no flag here"), "no flag here");
+    }
+
+    #[test]
+    fn setuid_install_is_disabled_next_to_chown() {
+        let builder = "(list \"--disable-use-tty-group\" \"--disable-makeinstall-chown\" \"--localstatedir=/var\")";
+        assert_eq!(
+            disable_builder_setuid_install(builder),
+            "(list \"--disable-use-tty-group\" \"--disable-makeinstall-chown\" \"--disable-makeinstall-setuid\" \"--localstatedir=/var\")"
+        );
+    }
+
+    #[test]
+    fn setuid_install_mode_is_normalized_next_to_ownership() {
+        let builder = r#"(substitute* (find-files "." "Makefile\\.in") (("-o [[:graph:]]+ -g [[:graph:]]+") ""))"#;
+        let rewritten = disable_builder_setuid_install(builder);
+        assert_eq!(
+            rewritten,
+            r#"(substitute* (find-files "." "Makefile\\.in") (("-o [[:graph:]]+ -g [[:graph:]]+") "") (("-m[[:space:]]+0?[2-7]([0-7][0-7][0-7])" _ mode) (string-append "-m 0" mode)))"#
+        );
+        assert_eq!(disable_builder_setuid_install(&rewritten), rewritten);
+    }
+
+    #[test]
+    fn setuid_install_rewrite_is_idempotent_and_targeted() {
+        let already_disabled =
+            "(list \"--disable-makeinstall-chown\" \"--disable-makeinstall-setuid\")";
+        assert_eq!(
+            disable_builder_setuid_install(already_disabled),
+            already_disabled
+        );
+        assert_eq!(
+            disable_builder_setuid_install("(list \"--localstatedir=/var\")"),
+            "(list \"--localstatedir=/var\")"
+        );
     }
 
     #[test]
