@@ -55,11 +55,18 @@ and everything above them — `mes`, `tcc`, `gcc-mesboot`, `glibc`, `guile`,
    <hash>`. `builtin:fetchurl` can only take one URL and can't fall back, and
    the upstream mirror lists are flaky — but the CA mirror serves *any* source
    Guix's CI has seen, keyed by the hash we already have. One reliable URL.
-2. **Sources are added** to the Nix store (text files get their `/gnu/store`
-   references rewritten first).
-3. **Every `/gnu/store` reference** — input derivations, builder, args, env — is
+   Normal translation never probes fallback URLs. `--upstream` probes the
+   original mirrors concurrently, then picks the first reachable URL in Guix's
+   order.
+2. **`builtin:git-download` → `fetchgit`.** Full and abbreviated commit IDs are
+   preserved. Tags are passed as full `refs/tags/...` refs so numeric tags are
+   not mistaken for commit IDs.
+3. **Sources are added** to the Nix store (text files get their `/gnu/store`
+   references rewritten first). Builders that suppress install-time ownership
+   changes also have install-time setuid and setgid modes disabled.
+4. **Every `/gnu/store` reference** — input derivations, builder, args, env — is
    rewritten to the already-translated `/nix/store` counterpart.
-4. **Output paths are blanked** and the derivation is registered via
+5. **Output paths are blanked** and the derivation is registered via
    `nix derivation add` (JSON format v4), which lets the Nix daemon compute the
    canonical output paths and `.drv` path itself.
 
@@ -99,7 +106,9 @@ You need `nix` (with the `nix-command` experimental feature) and a working
 
 Flags: `-v` for per-derivation logging, `--upstream` to fetch from the original
 mirrors (ranked + probed) instead of the Guix CA mirror, `--emit-nix <output.nix>`
-to generate a standalone Nix expression (see below).
+to generate a standalone Nix expression (see below). `--disable-tests` disables
+Guix builder test phases before paths are hashed; `--emit-nix-dir <directory>`
+emits a deduplicated import tree and verifies its derivations.
 
 ## `--emit-nix`: standalone Nix expressions
 
